@@ -46,7 +46,6 @@ class PetSnapshot
 	int size;
 	int idlePoseAnimation;
 	int walkAnimation;
-	int runAnimation;
 
 	static PetSnapshot fromNpc(NPC npc)
 	{
@@ -67,11 +66,11 @@ class PetSnapshot
 		String npcName = npc.getName() != null && !npc.getName().isEmpty()
 			? npc.getName()
 			: comp.getName();
-		return build(comp, npcName, npc.getIdlePoseAnimation(), npc.getWalkAnimation(), npc.getRunAnimation());
+		return build(comp, npcName, npc.getIdlePoseAnimation(), npc.getWalkAnimation());
 	}
 
 	static PetSnapshot restore(Client client, int npcId, String fallbackName,
-		int idlePoseAnimation, int walkAnimation, int runAnimation)
+		int idlePoseAnimation, int walkAnimation)
 	{
 		if (client == null || npcId < 0)
 		{
@@ -96,11 +95,11 @@ class PetSnapshot
 		{
 			name = fallbackName != null && !fallbackName.isEmpty() ? fallbackName : "Pet";
 		}
-		return build(comp, name, idlePoseAnimation, walkAnimation, runAnimation);
+		return build(comp, name, idlePoseAnimation, walkAnimation);
 	}
 
 	private static PetSnapshot build(NPCComposition comp, String name,
-		int idlePoseAnimation, int walkAnimation, int runAnimation)
+		int idlePoseAnimation, int walkAnimation)
 	{
 		int[] models = comp.getModels();
 		if (models == null || models.length == 0)
@@ -120,8 +119,7 @@ class PetSnapshot
 			comp.getHeightScale(),
 			Math.max(1, comp.getSize()),
 			idlePoseAnimation,
-			walkAnimation,
-			runAnimation
+			walkAnimation
 		);
 	}
 }

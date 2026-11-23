@@ -33,7 +33,6 @@ final class WorldLayout
 {
 	static final int SURFACE_TOP = 4160;
 	static final int CAVE_OFFSET = 6400;
-	private static final int ELSEWHERE_REACH = 128;
 
 	private WorldLayout()
 	{
@@ -52,15 +51,6 @@ final class WorldLayout
 	static int groundAbove(int y)
 	{
 		return isSurface(y) ? y : isCave(y) ? y - CAVE_OFFSET : -1;
-	}
-
-	static boolean sameLayer(int y1, int y2)
-	{
-		if (isSurface(y1) != isSurface(y2) || isCave(y1) != isCave(y2))
-		{
-			return false;
-		}
-		return isSurface(y1) || isCave(y1) || Math.abs(y1 - y2) < ELSEWHERE_REACH;
 	}
 
 	/** Chebyshev tile distance (diagonals cost 1 tick just like cardinals). */

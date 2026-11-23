@@ -85,7 +85,7 @@ public class RoamingPetTest
 	{
 		return new PetSnapshot(
 			6635, "Baby mole", new int[]{1234}, new short[0], new short[0],
-			128, 128, 1, 3310, 3311, -1
+			128, 128, 1, 3310, 3311
 		);
 	}
 }

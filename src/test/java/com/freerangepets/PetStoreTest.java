@@ -42,7 +42,7 @@ public class PetStoreTest
 
 		PetSnapshot snap = new PetSnapshot(
 			6635, "Baby mole", new int[]{1234}, new short[0], new short[0],
-			128, 128, 1, 3310, 3311, -1
+			128, 128, 1, 3310, 3311
 		);
 		RoamingPet pet = new RoamingPet(123456L, snap, new WorldPoint(3222, 3218, 0), 512);
 		pet.setNickname("Moley");
@@ -65,12 +65,12 @@ public class PetStoreTest
 	}
 
 	@Test
-	public void ignoresLegacyFieldsAndMalformedJson() throws Exception
+	public void ignoresUnknownFieldsAndMalformedJson() throws Exception
 	{
 		PetStore store = createStore();
 
-		String legacy = "[{\"id\":7,\"npcId\":6635,\"name\":\"Baby mole\",\"worldX\":2954,\"worldY\":3224,\"plane\":0,\"nodeId\":\"rimmington\"}]";
-		List<PetStore.SavedPet> decoded = store.deserialise(legacy);
+		String unknownField = "[{\"id\":7,\"npcId\":6635,\"name\":\"Baby mole\",\"worldX\":2954,\"worldY\":3224,\"plane\":0,\"nodeId\":\"rimmington\"}]";
+		List<PetStore.SavedPet> decoded = store.deserialise(unknownField);
 		assertEquals(1, decoded.size());
 		assertEquals(2954, decoded.get(0).getWorldX());
 

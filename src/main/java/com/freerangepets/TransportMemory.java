@@ -26,6 +26,7 @@
 package com.freerangepets;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 /**
@@ -54,6 +55,21 @@ final class TransportMemory
 	private int nextObstacle;
 
 	private int restUntil = Integer.MIN_VALUE;
+
+	/** Forgets everything, for when the client's tick counter starts again from zero. */
+	void clear()
+	{
+		Arrays.fill(recent, 0L);
+		Arrays.fill(expiry, 0);
+		Arrays.fill(journeys, null);
+		Arrays.fill(journeyExpiry, 0);
+		Arrays.fill(usedObstacles, null);
+		Arrays.fill(usedObstacleExpiry, 0);
+		next = 0;
+		nextJourney = 0;
+		nextObstacle = 0;
+		restUntil = Integer.MIN_VALUE;
+	}
 
 	boolean restingFromTransports(int tick)
 	{

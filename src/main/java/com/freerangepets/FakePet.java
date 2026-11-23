@@ -125,7 +125,8 @@ class FakePet extends RuneLiteObjectController
 
 		if (RoamingPet.isInScene(wv, drawX, drawY))
 		{
-			setZ(Perspective.getTileHeight(client, new LocalPoint(drawX, drawY, wv), pet.getPlane()));
+			// Heights grow downwards, so a hop's lift is taken off the ground height.
+			setZ(Perspective.getTileHeight(client, new LocalPoint(drawX, drawY, wv), pet.getPlane()) - pet.jumpArc());
 		}
 	}
 

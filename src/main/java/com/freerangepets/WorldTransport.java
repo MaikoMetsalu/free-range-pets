@@ -77,10 +77,6 @@ final class WorldTransport
 	@Getter
 	private boolean learnFirst;
 	@Getter
-	private int direction;
-	@Getter
-	private int reverse = -1;
-	@Getter
 	private int index = -1;
 
 	WorldTransport(int fromX, int fromY, int fromPlane, int toX, int toY, int toPlane,
@@ -104,16 +100,6 @@ final class WorldTransport
 	void setLearnFirst(boolean learnFirst)
 	{
 		this.learnFirst = learnFirst;
-	}
-
-	void setDirection(int direction)
-	{
-		this.direction = direction;
-	}
-
-	void setReverse(int reverse)
-	{
-		this.reverse = reverse;
 	}
 
 	void setIndex(int index)
@@ -172,7 +158,6 @@ final class WorldTransport
 			new int[0], new int[0], new int[0], new int[0]
 		);
 		back.learnFirst = learnFirst;
-		back.direction = -direction;
 		return back;
 	}
 

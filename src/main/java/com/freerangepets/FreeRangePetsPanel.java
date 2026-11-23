@@ -32,23 +32,34 @@ import java.awt.Dimension;
 import java.awt.FlowLayout;
 import java.awt.Font;
 import java.awt.Insets;
+import java.awt.MouseInfo;
+import java.awt.Point;
+import java.awt.PointerInfo;
+import java.awt.Window;
 import java.awt.event.FocusAdapter;
 import java.awt.event.FocusEvent;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import javax.swing.BorderFactory;
 import javax.swing.Box;
 import javax.swing.BoxLayout;
 import javax.swing.JButton;
+import javax.swing.JComponent;
 import javax.swing.JLabel;
+import javax.swing.JOptionPane;
 import javax.swing.JPanel;
 import javax.swing.JTextField;
 import javax.swing.SwingConstants;
 import javax.swing.SwingUtilities;
+import javax.swing.border.Border;
 import javax.swing.border.EmptyBorder;
 import javax.swing.event.DocumentEvent;
 import javax.swing.event.DocumentListener;
@@ -62,6 +73,13 @@ import net.runelite.client.ui.components.IconTextField;
  * Sidebar panel listing all roaming pets with their live locations, distances,
  * star toggles, inline renaming, Find buttons, remove buttons, and a Scatter
  * button to spread pets across Gielinor.
+ *
+ * <p>Rows belong to pets, not to positions in the list: each periodic update
+ * only changes the texts and colours that moved, and components are only
+ * added, removed or moved when the set or order of pets actually changes.
+ * All {@link RoamingPet} state shown here arrives through {@link RowData};
+ * the pet itself is only used as an identity key and handed back to the
+ * callbacks.
  */
 class FreeRangePetsPanel extends PluginPanel
 {
@@ -71,6 +89,12 @@ class FreeRangePetsPanel extends PluginPanel
 	private static final Color STAR_ON = new Color(0xFFD23F);
 	private static final Color STAR_OFF = new Color(110, 110, 110);
 	private static final Color FIND_ACTIVE = new Color(0x4C8C5A);
+
+	/**
+	 * How many updates a committed rename may be contradicted by stale data
+	 * before the panel gives up waiting for it and shows what it is told.
+	 */
+	private static final int PENDING_NAME_PATIENCE = 3;
 
 	@Value
 	static class RowData
@@ -94,6 +118,12 @@ class FreeRangePetsPanel extends PluginPanel
 	private final JButton scatterButton;
 	private final IconTextField searchField = new IconTextField();
 	private final JPanel listContainer = new JPanel();
+	private final JPanel emptyCard;
+	private final JLabel noMatchLabel;
+	private final JPanel noMatchCard;
+
+	/** Row components keyed by pet identity, for every pet currently tracked (shown or filtered out). */
+	private final Map<RoamingPet, PetRow> rowsByPet = new IdentityHashMap<>();
 
 	private List<RowData> currentRows = Collections.emptyList();
 
@@ -143,19 +173,19 @@ class FreeRangePetsPanel extends PluginPanel
 			@Override
 			public void insertUpdate(DocumentEvent e)
 			{
-				rebuildList();
+				refreshList();
 			}
 
 			@Override
 			public void removeUpdate(DocumentEvent e)
 			{
-				rebuildList();
+				refreshList();
 			}
 
 			@Override
 			public void changedUpdate(DocumentEvent e)
 			{
-				rebuildList();
+				refreshList();
 			}
 		});
 
@@ -171,10 +201,15 @@ class FreeRangePetsPanel extends PluginPanel
 		listContainer.setLayout(new BoxLayout(listContainer, BoxLayout.Y_AXIS));
 		listContainer.setBackground(ColorScheme.DARK_GRAY_COLOR);
 
+		emptyCard = buildEmptyCard(createEmptyLabel(
+			"Visit your POH Menagerie to let your pets roam freely across Gielinor."));
+		noMatchLabel = createEmptyLabel("");
+		noMatchCard = buildEmptyCard(noMatchLabel);
+
 		add(header, BorderLayout.NORTH);
 		add(listContainer, BorderLayout.CENTER);
 
-		rebuildList();
+		refreshList();
 	}
 
 	void updateRows(List<RowData> rows)
@@ -182,57 +217,156 @@ class FreeRangePetsPanel extends PluginPanel
 		List<RowData> copy = new ArrayList<>(rows);
 		SwingUtilities.invokeLater(() ->
 		{
-			Component focusOwner = SwingUtilities.getWindowAncestor(this) == null
-				? null
-				: SwingUtilities.getWindowAncestor(this).getFocusOwner();
-			if (focusOwner instanceof JTextField && SwingUtilities.isDescendingFrom(focusOwner, listContainer))
+			if (isEditingName())
 			{
 				return;
 			}
-			currentRows = copy;
-			rebuildList();
+			// A row moved out from under the pointer hands the click meant for it to
+			// another pet, so while the mouse is over the list the order stands; pets
+			// still come and go, and the next update after it leaves sorts them.
+			currentRows = isPointerOverList() ? keepCurrentOrder(copy) : copy;
+			refreshList();
 		});
 	}
 
-	private void rebuildList()
+	/** Whether the keyboard is in one of the rows' rename fields. */
+	private boolean isEditingName()
 	{
-		listContainer.removeAll();
+		Window window = SwingUtilities.getWindowAncestor(this);
+		Component focusOwner = window == null ? null : window.getFocusOwner();
+		return focusOwner instanceof JTextField && SwingUtilities.isDescendingFrom(focusOwner, listContainer);
+	}
+
+	private boolean isPointerOverList()
+	{
+		if (!listContainer.isShowing())
+		{
+			return false;
+		}
+		PointerInfo pointer = MouseInfo.getPointerInfo();
+		if (pointer == null)
+		{
+			return false;
+		}
+		Point at = pointer.getLocation();
+		SwingUtilities.convertPointFromScreen(at, listContainer);
+		return listContainer.contains(at);
+	}
+
+	/** The given rows in the order currently shown, with any new pets after them in the given order. */
+	private List<RowData> keepCurrentOrder(List<RowData> rows)
+	{
+		Map<RoamingPet, RowData> byPet = new IdentityHashMap<>();
+		for (RowData row : rows)
+		{
+			byPet.put(row.getPet(), row);
+		}
+		List<RowData> ordered = new ArrayList<>(rows.size());
+		for (RowData old : currentRows)
+		{
+			RowData row = byPet.remove(old.getPet());
+			if (row != null)
+			{
+				ordered.add(row);
+			}
+		}
+		for (RowData row : rows)
+		{
+			if (byPet.remove(row.getPet()) != null)
+			{
+				ordered.add(row);
+			}
+		}
+		return ordered;
+	}
+
+	/**
+	 * Brings the list in line with {@link #currentRows} and the search filter:
+	 * updates existing rows in place, builds rows only for new pets, drops rows
+	 * for pets that are gone, and only touches the container's children (and
+	 * revalidates) when what is shown, or its order, changed.
+	 */
+	private void refreshList()
+	{
 		int total = currentRows.size();
 		scatterButton.setVisible(total > 1);
+		headerCount.setText(total == 0 ? "No roaming pets yet"
+			: total == 1 ? "1 pet roaming Gielinor" : total + " pets roaming Gielinor");
 
-		if (total == 0)
+		String rawQuery = searchField.getText() == null ? "" : searchField.getText().trim();
+		String query = rawQuery.toLowerCase(Locale.ROOT);
+
+		Set<RoamingPet> present = Collections.newSetFromMap(new IdentityHashMap<>());
+		List<Component> wanted = new ArrayList<>();
+		for (RowData data : currentRows)
 		{
-			headerCount.setText("No roaming pets yet");
-			listContainer.add(buildEmptyCard(
-				"Visit your POH Menagerie to let your pets roam freely across Gielinor."
-			));
-			listContainer.revalidate();
-			listContainer.repaint();
-			return;
-		}
-
-		headerCount.setText(total == 1 ? "1 pet roaming Gielinor" : total + " pets roaming Gielinor");
-
-		String query = searchField.getText() == null ? "" : searchField.getText().trim().toLowerCase(Locale.ROOT);
-		int shown = 0;
-		for (RowData row : currentRows)
-		{
-			if (!query.isEmpty() && !matches(row, query))
+			RoamingPet pet = data.getPet();
+			if (!present.add(pet))
 			{
 				continue;
 			}
-			listContainer.add(buildPetCard(row));
-			listContainer.add(Box.createVerticalStrut(6));
-			shown++;
+			PetRow row = rowsByPet.get(pet);
+			if (row == null)
+			{
+				row = new PetRow(data);
+				rowsByPet.put(pet, row);
+			}
+			else
+			{
+				row.update(data);
+			}
+			if (query.isEmpty() || matches(data, query))
+			{
+				wanted.add(row.card);
+				wanted.add(row.gap);
+			}
 		}
+		rowsByPet.keySet().retainAll(present);
 
-		if (shown == 0)
+		if (total == 0)
 		{
-			listContainer.add(buildEmptyCard("No pets match \"" + searchField.getText().trim() + "\"."));
+			wanted.add(emptyCard);
+		}
+		else if (wanted.isEmpty())
+		{
+			noMatchLabel.setText(emptyCardHtml("No pets match \"" + rawQuery + "\"."));
+			wanted.add(noMatchCard);
 		}
 
-		listContainer.revalidate();
-		listContainer.repaint();
+		if (syncChildren(wanted))
+		{
+			listContainer.revalidate();
+			listContainer.repaint();
+		}
+	}
+
+	/**
+	 * Makes the list container's children exactly {@code wanted}, in order,
+	 * moving only the components that are out of place.
+	 *
+	 * @return whether anything was added, removed or moved
+	 */
+	private boolean syncChildren(List<Component> wanted)
+	{
+		boolean changed = false;
+		for (int i = 0; i < wanted.size(); i++)
+		{
+			Component component = wanted.get(i);
+			if (i < listContainer.getComponentCount() && listContainer.getComponent(i) == component)
+			{
+				continue;
+			}
+			// No-op when it is not (yet) a child.
+			listContainer.remove(component);
+			listContainer.add(component, i);
+			changed = true;
+		}
+		while (listContainer.getComponentCount() > wanted.size())
+		{
+			listContainer.remove(listContainer.getComponentCount() - 1);
+			changed = true;
+		}
+		return changed;
 	}
 
 	private static boolean matches(RowData row, String query)
@@ -242,112 +376,215 @@ class FreeRangePetsPanel extends PluginPanel
 			|| row.getLocation().toLowerCase(Locale.ROOT).contains(query);
 	}
 
-	private JPanel buildEmptyCard(String message)
+	/** The nickname a row's data implies: empty when the pet goes by its species name. */
+	private static String nicknameOf(RowData data)
+	{
+		return data.getDisplayName().equals(data.getSpeciesName()) ? "" : data.getDisplayName();
+	}
+
+	private static String emptyCardHtml(String message)
+	{
+		return "<html><body style='width: 175px; text-align: center;'>" + message + "</body></html>";
+	}
+
+	private static JLabel createEmptyLabel(String message)
+	{
+		JLabel label = new JLabel(emptyCardHtml(message), SwingConstants.CENTER);
+		label.setFont(SMALL_FONT);
+		label.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
+		return label;
+	}
+
+	private static JPanel buildEmptyCard(JLabel label)
 	{
 		JPanel card = new JPanel(new BorderLayout());
 		card.setBackground(ColorScheme.DARKER_GRAY_COLOR);
 		card.setBorder(new EmptyBorder(12, 10, 12, 10));
 		card.setMaximumSize(new Dimension(Integer.MAX_VALUE, 96));
-
-		JLabel label = new JLabel("<html><body style='width: 175px; text-align: center;'>"
-			+ message + "</body></html>", SwingConstants.CENTER);
-		label.setFont(SMALL_FONT);
-		label.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
 		card.add(label, BorderLayout.CENTER);
 		return card;
 	}
 
-	private JPanel buildPetCard(RowData row)
+	private static Border cardBorder(boolean finding)
 	{
-		JPanel card = new JPanel(new BorderLayout(4, 4));
-		card.setBackground(ColorScheme.DARKER_GRAY_COLOR);
-		card.setBorder(BorderFactory.createCompoundBorder(
-			BorderFactory.createLineBorder(row.isFinding() ? FIND_ACTIVE : ColorScheme.DARK_GRAY_COLOR),
+		return BorderFactory.createCompoundBorder(
+			BorderFactory.createLineBorder(finding ? FIND_ACTIVE : ColorScheme.DARK_GRAY_COLOR),
 			new EmptyBorder(6, 7, 6, 7)
-		));
-		card.setMaximumSize(new Dimension(Integer.MAX_VALUE, 64));
+		);
+	}
 
-		JButton starBtn = createIconButton(row.isFavourite() ? "★" : "☆",
-			row.isFavourite() ? STAR_ON : STAR_OFF,
-			row.isFavourite() ? "Unstar pet" : "Star pet to pin at top");
-		starBtn.addActionListener(e -> onStar.accept(row.getPet()));
+	private static void setToolTip(JComponent component, String tooltip)
+	{
+		if (!Objects.equals(component.getToolTipText(), tooltip))
+		{
+			component.setToolTipText(tooltip);
+		}
+	}
 
-		JTextField nameField = new JTextField(row.getDisplayName());
-		nameField.setFont(NAME_FONT);
-		nameField.setForeground(Color.WHITE);
-		nameField.setCaretColor(Color.WHITE);
-		nameField.setBackground(ColorScheme.DARKER_GRAY_COLOR);
-		nameField.setBorder(BorderFactory.createEmptyBorder(0, 2, 0, 2));
-		nameField.setToolTipText(row.getSpeciesName() + " — click to rename");
-		Runnable commitName = () ->
+	/** One pet's card, built once and updated in place for as long as the pet is tracked. */
+	private final class PetRow
+	{
+		private final RoamingPet pet;
+		private final JPanel card = new JPanel(new BorderLayout(4, 4));
+		private final Component gap = Box.createVerticalStrut(6);
+		private final JButton starBtn;
+		private final JTextField nameField = new JTextField();
+		private final JButton findBtn;
+		private final JLabel whereLabel = new JLabel();
+
+		/** The latest data for this pet; only ever replaced on the Swing thread. */
+		private RowData data;
+		private boolean borderFinding;
+
+		/**
+		 * A nickname committed but not yet reflected in {@link #data} ("" for
+		 * cleared), so stale updates neither undo it on screen nor resend it.
+		 */
+		private String pendingName;
+		private int pendingStale;
+
+		private PetRow(RowData initial)
+		{
+			pet = initial.getPet();
+			data = initial;
+
+			borderFinding = initial.isFinding();
+			card.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+			card.setBorder(cardBorder(borderFinding));
+			card.setMaximumSize(new Dimension(Integer.MAX_VALUE, 64));
+
+			starBtn = createIconButton("☆", STAR_OFF, "Star pet to pin at top");
+			starBtn.addActionListener(e -> onStar.accept(pet));
+
+			nameField.setFont(NAME_FONT);
+			nameField.setForeground(Color.WHITE);
+			nameField.setCaretColor(Color.WHITE);
+			nameField.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+			nameField.setBorder(BorderFactory.createEmptyBorder(0, 2, 0, 2));
+			nameField.addActionListener(e ->
+			{
+				commitName();
+				listContainer.requestFocusInWindow();
+			});
+			nameField.addFocusListener(new FocusAdapter()
+			{
+				@Override
+				public void focusLost(FocusEvent e)
+				{
+					commitName();
+				}
+			});
+
+			findBtn = createActionButton("Find", ColorScheme.MEDIUM_GRAY_COLOR,
+				"Point a hint arrow toward this pet");
+			findBtn.addActionListener(e -> onFind.accept(pet));
+
+			JButton removeBtn = createIconButton("×", ColorScheme.LIGHT_GRAY_COLOR,
+				"Remove from roaming list (re-visiting your POH Menagerie will add it again)");
+			removeBtn.addActionListener(e -> confirmRemove());
+
+			JPanel actions = new JPanel(new FlowLayout(FlowLayout.RIGHT, 3, 0));
+			actions.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+			actions.add(findBtn);
+			actions.add(removeBtn);
+
+			JPanel top = new JPanel(new BorderLayout(4, 0));
+			top.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+			top.add(starBtn, BorderLayout.WEST);
+			top.add(nameField, BorderLayout.CENTER);
+			top.add(actions, BorderLayout.EAST);
+
+			whereLabel.setFont(SMALL_FONT);
+			whereLabel.setBorder(new EmptyBorder(0, 18, 0, 0));
+
+			card.add(top, BorderLayout.NORTH);
+			card.add(whereLabel, BorderLayout.SOUTH);
+
+			update(initial);
+		}
+
+		/** Applies new data, touching only what changed (Swing's setters skip unchanged text and colours). */
+		private void update(RowData next)
+		{
+			data = next;
+
+			boolean fav = next.isFavourite();
+			starBtn.setText(fav ? "★" : "☆");
+			starBtn.setForeground(fav ? STAR_ON : STAR_OFF);
+			setToolTip(starBtn, fav ? "Unstar pet" : "Star pet to pin at top");
+
+			if (pendingName != null)
+			{
+				String expected = pendingName.isEmpty() ? next.getSpeciesName() : pendingName;
+				if (next.getDisplayName().equals(expected) || ++pendingStale > PENDING_NAME_PATIENCE)
+				{
+					pendingName = null;
+				}
+			}
+			if (pendingName == null && !nameField.isFocusOwner()
+				&& !nameField.getText().equals(next.getDisplayName()))
+			{
+				nameField.setText(next.getDisplayName());
+				nameField.setCaretPosition(0);
+			}
+			setToolTip(nameField, next.getSpeciesName() + " — click to rename");
+
+			boolean finding = next.isFinding();
+			findBtn.setText(finding ? "Stop" : "Find");
+			findBtn.setBackground(finding ? FIND_ACTIVE : ColorScheme.MEDIUM_GRAY_COLOR);
+			setToolTip(findBtn, finding ? "Stop tracking this pet" : "Point a hint arrow toward this pet");
+			findBtn.setEnabled(!next.isFollowing());
+
+			if (finding != borderFinding)
+			{
+				borderFinding = finding;
+				card.setBorder(cardBorder(finding));
+			}
+
+			String whereText;
+			if (next.isFollowing())
+			{
+				whereText = "Following you";
+			}
+			else if (next.getDistance() >= 0)
+			{
+				whereText = next.getLocation() + " · " + next.getDistance() + " tiles";
+			}
+			else
+			{
+				whereText = next.getLocation();
+			}
+			whereLabel.setText(whereText);
+			whereLabel.setForeground(next.isFollowing() ? ColorScheme.PROGRESS_COMPLETE_COLOR : ColorScheme.LIGHT_GRAY_COLOR);
+		}
+
+		private void commitName()
 		{
 			String typed = nameField.getText().trim();
-			if (typed.equals(row.getSpeciesName()))
+			if (typed.equals(data.getSpeciesName()))
 			{
 				typed = "";
 			}
-			String prev = row.getPet().getNickname() == null ? "" : row.getPet().getNickname();
-			if (!typed.equals(prev))
+			String current = pendingName != null ? pendingName : nicknameOf(data);
+			if (!typed.equals(current))
 			{
-				onRename.accept(row.getPet(), typed.isEmpty() ? null : typed);
+				pendingName = typed;
+				pendingStale = 0;
+				onRename.accept(pet, typed.isEmpty() ? null : typed);
 			}
-		};
-		nameField.addActionListener(e ->
+		}
+
+		private void confirmRemove()
 		{
-			commitName.run();
-			listContainer.requestFocusInWindow();
-		});
-		nameField.addFocusListener(new FocusAdapter()
-		{
-			@Override
-			public void focusLost(FocusEvent e)
+			int choice = JOptionPane.showConfirmDialog(FreeRangePetsPanel.this,
+				"Stop tracking " + data.getDisplayName() + "? Visiting your POH Menagerie again will bring it back.",
+				"Remove pet",
+				JOptionPane.YES_NO_OPTION);
+			if (choice == JOptionPane.YES_OPTION)
 			{
-				commitName.run();
+				onRemove.accept(pet);
 			}
-		});
-
-		JButton findBtn = createActionButton(row.isFinding() ? "Stop" : "Find",
-			row.isFinding() ? FIND_ACTIVE : ColorScheme.MEDIUM_GRAY_COLOR,
-			row.isFinding() ? "Stop tracking this pet" : "Point a hint arrow toward this pet");
-		findBtn.setEnabled(!row.isFollowing());
-		findBtn.addActionListener(e -> onFind.accept(row.getPet()));
-
-		JButton removeBtn = createIconButton("×", ColorScheme.LIGHT_GRAY_COLOR,
-			"Remove from roaming list (re-visiting your POH Menagerie will add it again)");
-		removeBtn.addActionListener(e -> onRemove.accept(row.getPet()));
-
-		JPanel actions = new JPanel(new FlowLayout(FlowLayout.RIGHT, 3, 0));
-		actions.setBackground(ColorScheme.DARKER_GRAY_COLOR);
-		actions.add(findBtn);
-		actions.add(removeBtn);
-
-		JPanel top = new JPanel(new BorderLayout(4, 0));
-		top.setBackground(ColorScheme.DARKER_GRAY_COLOR);
-		top.add(starBtn, BorderLayout.WEST);
-		top.add(nameField, BorderLayout.CENTER);
-		top.add(actions, BorderLayout.EAST);
-
-		String whereText;
-		if (row.isFollowing())
-		{
-			whereText = "Following you";
 		}
-		else if (row.getDistance() >= 0)
-		{
-			whereText = row.getLocation() + " · " + row.getDistance() + " tiles";
-		}
-		else
-		{
-			whereText = row.getLocation();
-		}
-		JLabel whereLabel = new JLabel(whereText);
-		whereLabel.setFont(SMALL_FONT);
-		whereLabel.setForeground(row.isFollowing() ? ColorScheme.PROGRESS_COMPLETE_COLOR : ColorScheme.LIGHT_GRAY_COLOR);
-		whereLabel.setBorder(new EmptyBorder(0, 18, 0, 0));
-
-		card.add(top, BorderLayout.NORTH);
-		card.add(whereLabel, BorderLayout.SOUTH);
-		return card;
 	}
 
 	private static JButton createIconButton(String symbol, Color fg, String tooltip)

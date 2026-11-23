@@ -36,11 +36,11 @@ import javax.inject.Singleton;
 class PetCensus
 {
 	/**
-	 * A pet strongly prefers having its own region: entering a region that
-	 * already holds another pet is heavily penalised, and sharing a region with
-	 * another pet encourages walking or taking a transport elsewhere.
+	 * Pets in one region, the asking pet included, before it is crowded. Two pets
+	 * meeting is not a crowd: treating it as one had them seeking transports at
+	 * every pause the moment they met.
 	 */
-	static final int IDEAL_PER_REGION = 1;
+	static final int CROWDED = 3;
 
 	private final int[] counts = new int[1 << 18];
 
@@ -82,30 +82,28 @@ class PetCensus
 	}
 
 	/**
-	 * True when another pet already shares this 64x64 region and plane, prompting
-	 * this pet to wander onward rather than settle down together.
+	 * True when this region and plane holds {@link #CROWDED} or more pets, the
+	 * asking pet included: enough that it looks for a way out rather than settle.
 	 */
 	boolean isSharedRegion(int x, int y, int plane)
 	{
-		return at(x, y, plane) > IDEAL_PER_REGION;
+		return at(x, y, plane) >= CROWDED;
 	}
 
 	/**
 	 * Desirability of entering this tile's region (0..1): 1.0 when empty, steeply
-	 * lower when another pet is already there.
+	 * lower for each other pet already there.
+	 *
+	 * @param self how many of the counted pets are the one asking (1 if it is in that region)
 	 */
-	float roominess(int x, int y, int plane)
+	float roominess(int x, int y, int plane, int self)
 	{
-		int existing = at(x, y, plane);
-		if (existing <= 0)
+		int others = at(x, y, plane) - self;
+		if (others <= 0)
 		{
 			return 1f;
 		}
-		if (existing == 1)
-		{
-			return 0.15f;
-		}
-		return 0.15f / (float) existing;
+		return 0.15f / (float) others;
 	}
 
 	private static int key(int x, int y, int plane)

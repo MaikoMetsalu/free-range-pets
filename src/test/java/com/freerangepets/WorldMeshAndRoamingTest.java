@@ -68,7 +68,7 @@ public class WorldMeshAndRoamingTest
 			context.setCensus(census);
 			context.setPlanner(planner);
 			context.setOccupancy(new TileMap(32));
-			context.setMayPath(true);
+			context.setSearchBudget(Integer.MAX_VALUE);
 		}
 
 		static WorldHarness create() throws Exception
@@ -129,11 +129,22 @@ public class WorldMeshAndRoamingTest
 		assertEquals(1, world.census.at(3222, 3218, 0));
 		assertFalse(world.census.isSharedRegion(3222, 3218, 0));
 		assertTrue("Occupied region should strongly discourage another pet entering",
-			world.census.roominess(3222, 3218, 0) < 0.25f);
+			world.census.roominess(3222, 3218, 0, 0) < 0.25f);
+		assertEquals("A pet does not crowd its own region",
+			1f, world.census.roominess(3222, 3218, 0, 1), 0f);
+		assertEquals("A door within its own region is not penalised by the pet itself",
+			1f, world.context.appeal(3222, 3218, 0, 3223, 3219, 0), 0f);
 
 		world.census.add(3225, 3220, 0);
-		assertTrue("Two pets in the same region should mark it shared",
+		assertFalse("Two pets meeting is not a crowd",
 			world.census.isSharedRegion(3222, 3218, 0));
+
+		world.census.add(3228, 3221, 0);
+		assertTrue("Three pets in the same region should mark it crowded",
+			world.census.isSharedRegion(3222, 3218, 0));
+
+		assertTrue("A crowded pet should prefer leaving its region",
+			world.context.appeal(3222, 3218, 0, 3223, 3219, 0) < 0.25f);
 
 		// Personal-space check around another pet at (3220, 3218)
 		world.context.getOccupancy().addTo(RoamContext.tileKey(3220, 3218, 0), 1L);

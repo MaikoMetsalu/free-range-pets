@@ -70,18 +70,23 @@ class PetDetector
 		menageriePresent = false;
 	}
 
-	void onChatMessage(String message)
+	/**
+	 * Notes which house the player is heading into from the menu option used. The
+	 * game has no message or varbit naming the house owner, so the choice at the
+	 * portal (or a teleport, which always goes home) is what tells them apart.
+	 */
+	void onMenuOptionClicked(String option)
 	{
-		if (message == null)
+		if (option == null)
 		{
 			return;
 		}
-		String lower = message.toLowerCase();
-		if (lower.contains("friend's house") || lower.contains("other player's house"))
+		String lower = option.toLowerCase();
+		if (lower.contains("friend's house") || lower.contains("visit-last"))
 		{
 			visitedOtherHouse = true;
 		}
-		else if (lower.contains("welcome to your house"))
+		else if (lower.equals("home") || lower.equals("build mode") || lower.contains("tele to poh"))
 		{
 			visitedOtherHouse = false;
 		}

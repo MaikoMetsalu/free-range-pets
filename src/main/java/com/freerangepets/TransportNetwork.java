@@ -69,8 +69,6 @@ class TransportNetwork
 	private static final int MAGIC = -0x7472;
 	private static final int VERSION = 2;
 	private static final int FLAG_LEARN_FIRST = 1;
-	private static final int FLAG_UP = 2;
-	private static final int FLAG_DOWN = 4;
 
 	private static final int[] NONE = new int[0];
 	private static final Map<String, String> QUEST_ALIASES = Collections.singletonMap(
@@ -129,14 +127,13 @@ class TransportNetwork
 					{
 						int flags = data.readByte();
 						t.setLearnFirst((flags & FLAG_LEARN_FIRST) != 0);
-						t.setDirection((flags & FLAG_UP) != 0 ? 1 : (flags & FLAG_DOWN) != 0 ? -1 : 0);
 					}
 					transports.add(t);
 				}
 			}
 
 			index();
-			link();
+			revision++;
 			log.debug("Loaded {} transports across {} origin tiles", transports.size(), byOrigin.size());
 		}
 		catch (IOException | RuntimeException e)
@@ -249,24 +246,6 @@ class TransportNetwork
 				k -> new ArrayList<>()).add(t);
 		}
 		byOrigin.replaceAll((k, v) -> Collections.unmodifiableList(v));
-	}
-
-	private void link()
-	{
-		revision++;
-		Map<Long, Integer> byEndpoints = new HashMap<>(transports.size() * 2);
-		for (WorldTransport t : transports)
-		{
-			byEndpoints.put(t.endpointKey(), t.getIndex());
-		}
-		for (WorldTransport t : transports)
-		{
-			Integer other = byEndpoints.get(t.reverseKey());
-			if (other != null)
-			{
-				t.setReverse(other);
-			}
-		}
 	}
 
 	private static int[] parseSkills(String spec)

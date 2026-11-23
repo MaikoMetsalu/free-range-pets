@@ -165,11 +165,6 @@ final class Itinerary
 		return tick - startTick >= duration;
 	}
 
-	boolean isStationary()
-	{
-		return xs.length == 1 && landing == null && transport == null;
-	}
-
 	WorldTransport transport()
 	{
 		return transport;

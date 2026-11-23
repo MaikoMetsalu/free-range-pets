@@ -66,8 +66,13 @@ final class RoamContext
 	@Setter
 	private int tick;
 
-	@Setter
-	private boolean mayPath;
+	/** Path search cost left this frame; see {@link #spendSearch}. */
+	@Getter(lombok.AccessLevel.NONE)
+	private int searchBudget;
+
+	/** Set when a search was refused for want of budget since the last {@link #clearSearchRefused}. */
+	@Getter(lombok.AccessLevel.NONE)
+	private boolean searchRefused;
 
 	private final Map<Long, int[]> areas = new LinkedHashMap<Long, int[]>(1024, 0.75f, true)
 	{
@@ -77,6 +82,48 @@ final class RoamContext
 			return size() > MOST_AREAS;
 		}
 	};
+
+	void setSearchBudget(int budget)
+	{
+		searchBudget = budget;
+	}
+
+	boolean hasSearchBudget()
+	{
+		return searchBudget > 0;
+	}
+
+	/**
+	 * Pays for a path search out of this frame's budget.
+	 *
+	 * @return false, and the search must not run, when the budget is spent
+	 */
+	boolean spendSearch(int cost)
+	{
+		if (searchBudget <= 0)
+		{
+			searchRefused = true;
+			return false;
+		}
+		searchBudget -= cost;
+		return true;
+	}
+
+	void clearSearchRefused()
+	{
+		searchRefused = false;
+	}
+
+	boolean isSearchRefused()
+	{
+		return searchRefused;
+	}
+
+	/** Forgets cached room sizes, which are stamped by tick. */
+	void timelineReset()
+	{
+		areas.clear();
+	}
 
 	boolean crowdedRegion(int x, int y, int plane)
 	{
@@ -94,12 +141,14 @@ final class RoamContext
 			return 1f;
 		}
 		boolean sharedHere = census.isSharedRegion(fromX, fromY, fromPlane);
-		float there = census.roominess(toX, toY, toPlane);
+		// The pet asking is counted in its own region: a door within it is not a crowd.
+		boolean sameRegion = fromPlane == toPlane && (fromX >> 6) == (toX >> 6) && (fromY >> 6) == (toY >> 6);
+		float there = census.roominess(toX, toY, toPlane, sameRegion ? 1 : 0);
 		if (!sharedHere)
 		{
 			return there;
 		}
-		if (fromPlane == toPlane && (fromX >> 6) == (toX >> 6) && (fromY >> 6) == (toY >> 6))
+		if (sameRegion)
 		{
 			return STAYING_PUT;
 		}

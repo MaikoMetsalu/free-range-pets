@@ -75,7 +75,6 @@ class PetStore
 		int orientation;
 		int idleAnimation;
 		int walkAnimation;
-		int runAnimation;
 	}
 
 	String serialise(List<RoamingPet> pets)
@@ -96,8 +95,7 @@ class PetStore
 				tile.getPlane(),
 				pet.getOrientation(),
 				snap.getIdlePoseAnimation(),
-				snap.getWalkAnimation(),
-				snap.getRunAnimation()
+				snap.getWalkAnimation()
 			));
 		}
 		return gson.toJson(saved, LIST_TYPE);
@@ -128,8 +126,7 @@ class PetStore
 			saved.getNpcId(),
 			saved.getName(),
 			saved.getIdleAnimation(),
-			saved.getWalkAnimation(),
-			saved.getRunAnimation()
+			saved.getWalkAnimation()
 		);
 		if (snapshot == null)
 		{

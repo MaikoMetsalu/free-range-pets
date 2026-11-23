@@ -58,6 +58,7 @@ class RoamPlanner
 	private static final int IDLE_SPREAD = 16;
 	private static final int UNKNOWN_REACH = 4;
 	private static final int SHUT_IN = 8;
+	private static final int UNMESHED_REMEMBERED = 50_000;
 
 	static final float HOMEWARD_CHANCE = 0.25f;
 	static final float DEAD_END_APPEAL = 0.6f;
@@ -139,6 +140,7 @@ class RoamPlanner
 	private final Map<Integer, List<WorldTransport>> exitsFrom = new HashMap<>();
 	private final Map<Integer, List<WorldTransport>> waysBackFrom = new HashMap<>();
 	private final Map<Integer, List<WorldTransport>> waysHome = new HashMap<>();
+	private final Map<Long, List<WorldTransport>> unmeshedWays = new HashMap<>();
 
 	/**
 	 * Picks a walkable starting tile in an unoccupied region across Gielinor so
@@ -303,20 +305,143 @@ class RoamPlanner
 		if (waysHomeBuild != back.builds())
 		{
 			waysHome.clear();
+			unmeshedWays.clear();
 			waysHomeBuild = back.builds();
 		}
 		int component = componentNear(x, y, plane);
-		if (component == 0)
-		{
-			return null;
-		}
-		List<WorldTransport> ways = waysHome.computeIfAbsent(component, this::findWaysHome);
+		List<WorldTransport> ways = component == 0
+			? unmeshedWaysHome(x, y, plane)
+			: waysHome.computeIfAbsent(component, this::findWaysHome);
 		if (ways.isEmpty())
 		{
 			return null;
 		}
 		WorldTransport way = ways.get(random.nextInt(ways.size()));
 		return memory != null && memory.onCooldown(way, tick) ? null : way;
+	}
+
+	/**
+	 * The ways back out of a room the mesh knows nothing about (content newer than
+	 * the bundled mesh), worked out from live collision: transports leading out of
+	 * the room onto meshed ground, or else back through whatever led in.
+	 */
+	private List<WorldTransport> unmeshedWaysHome(int x, int y, int plane)
+	{
+		long key = RoamContext.tileKey(x, y, plane);
+		List<WorldTransport> known = unmeshedWays.get(key);
+		if (known != null)
+		{
+			return known;
+		}
+		if (unmeshedWays.size() > UNMESHED_REMEMBERED)
+		{
+			unmeshedWays.clear();
+		}
+		boolean remember = collision.isKnownWalkable(x, y, plane);
+		TileMap room = unmeshedRoom(x, y, plane);
+		if (room == null)
+		{
+			if (remember)
+			{
+				unmeshedWays.put(key, Collections.emptyList());
+			}
+			return Collections.emptyList();
+		}
+		List<WorldTransport> ways = new ArrayList<>();
+		List<WorldTransport> fromHome = new ArrayList<>();
+		for (WorldTransport t : transports.all())
+		{
+			if (!abilities.canUse(t))
+			{
+				continue;
+			}
+			boolean fromIn = t.getFromPlane() == plane && inRoom(room, t.getFromX(), t.getFromY());
+			boolean toIn = t.getToPlane() == plane && inRoom(room, t.getToX(), t.getToY());
+			if (fromIn && !toIn && joinedToHome(t.getToX(), t.getToY(), t.getToPlane()))
+			{
+				// A way out exists already; ordinary roaming will find it.
+				ways = Collections.emptyList();
+				fromHome = ways;
+				break;
+			}
+			if (toIn && !fromIn && !mesh.isCutOff(t.getFromX(), t.getFromY(), t.getFromPlane()))
+			{
+				WorldTransport back = t.backThrough();
+				ways.add(back);
+				if (joinedToHome(t.getFromX(), t.getFromY(), t.getFromPlane()))
+				{
+					fromHome.add(back);
+				}
+			}
+		}
+		if (!fromHome.isEmpty())
+		{
+			ways = fromHome;
+		}
+		for (int i = 0; remember && i < room.size(); i++)
+		{
+			long tile = room.keyAt(i);
+			unmeshedWays.put(RoamContext.tileKey(PetPathfinder.unpackX(tile), PetPathfinder.unpackY(tile), plane), ways);
+		}
+		return ways;
+	}
+
+	private boolean joinedToHome(int x, int y, int plane)
+	{
+		return componentNear(x, y, plane) != 0 && !mesh.isCutOff(x, y, plane);
+	}
+
+	/**
+	 * The unmeshed floor walkable from a tile, or null as soon as it touches
+	 * ground the mesh knows.
+	 */
+	private TileMap unmeshedRoom(int x, int y, int plane)
+	{
+		TileMap room = new TileMap(1024);
+		room.add(PetPathfinder.pack(x, y), 0);
+		for (int head = 0; head < room.size(); head++)
+		{
+			long at = room.keyAt(head);
+			int cx = PetPathfinder.unpackX(at);
+			int cy = PetPathfinder.unpackY(at);
+			for (int dx = -1; dx <= 1; dx++)
+			{
+				for (int dy = -1; dy <= 1; dy++)
+				{
+					if (dx == 0 && dy == 0)
+					{
+						continue;
+					}
+					long next = PetPathfinder.pack(cx + dx, cy + dy);
+					if (room.containsKey(next) || !collision.isKnownWalkable(cx + dx, cy + dy, plane)
+						|| !collision.canStep(cx, cy, plane, dx, dy))
+					{
+						continue;
+					}
+					if (mesh.componentAt(cx + dx, cy + dy, plane) != 0)
+					{
+						return null;
+					}
+					room.add(next, 0);
+				}
+			}
+		}
+		return room;
+	}
+
+	private static boolean inRoom(TileMap room, int x, int y)
+	{
+		for (int dx = -1; dx <= 1; dx++)
+		{
+			for (int dy = -1; dy <= 1; dy++)
+			{
+				if (room.containsKey(PetPathfinder.pack(x + dx, y + dy)))
+				{
+					return true;
+				}
+			}
+		}
+		return false;
 	}
 
 	Set<Integer> spacesLeft(int x, int y, int plane, int tick, TransportMemory memory)
@@ -471,8 +596,7 @@ class RoamPlanner
 					from.getPlane())
 				|| !abilities.canUse(transport)
 				|| !landsSomewhereUseful(transport)
-				|| leadsInto(cameFrom, transport)
-				|| !mayEnter(transport, tick))
+				|| leadsInto(cameFrom, transport))
 			{
 				continue;
 			}
@@ -486,10 +610,15 @@ class RoamPlanner
 					transport.getToX(), transport.getToY(), transport.getToPlane());
 			if (appeal < 1f && random.nextFloat() >= appeal)
 			{
-				if (crowdedChoice == null)
+				if (crowdedChoice == null && mayEnter(transport, tick))
 				{
 					crowdedChoice = transport;
 				}
+				continue;
+			}
+			// Asked after the rolls, which turn most choices down for less: it floods.
+			if (!mayEnter(transport, tick))
+			{
 				continue;
 			}
 			List<int[]> path = walk(from, transport.getFromX(), transport.getFromY(), reach);
@@ -672,6 +801,7 @@ class RoamPlanner
 		exitsFrom.clear();
 		waysBackFrom.clear();
 		waysHome.clear();
+		unmeshedWays.clear();
 		for (WorldTransport t : transports.all())
 		{
 			int from = componentNear(t.getFromX(), t.getFromY(), t.getFromPlane());

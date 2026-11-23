@@ -30,6 +30,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
@@ -37,7 +38,6 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
-import net.runelite.api.ChatMessageType;
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
 import net.runelite.api.HintArrowType;
@@ -48,12 +48,12 @@ import net.runelite.api.Renderable;
 import net.runelite.api.WorldView;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.events.BeforeRender;
-import net.runelite.api.events.ChatMessage;
 import net.runelite.api.events.ClientTick;
 import net.runelite.api.events.GameObjectDespawned;
 import net.runelite.api.events.GameObjectSpawned;
 import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.GameTick;
+import net.runelite.api.events.MenuOptionClicked;
 import net.runelite.api.events.WallObjectDespawned;
 import net.runelite.api.events.WallObjectSpawned;
 import net.runelite.api.gameval.VarbitID;
@@ -91,12 +91,25 @@ import net.runelite.client.util.ImageUtil;
 )
 public class FreeRangePetsPlugin extends Plugin
 {
-	private static final int SAVE_INTERVAL_TICKS = 150;
+	private static final int SAVE_INTERVAL_TICKS = 200;
+	private static final int SAVE_SOON_TICKS = 2;
 	private static final int SIDEBAR_REFRESH_TICKS = 3;
 	private static final int CENSUS_REFRESH_TICKS = 10;
-	private static final int FAR_CHECK_INTERVAL_TICKS = 8;
-	private static final int PATH_SEARCHES_PER_FRAME = 3;
-	private static final int NEAR_DISTANCE_TILES = 96;
+	private static final int FAR_CHECK_INTERVAL_TICKS = 5;
+	private static final int NEAR_DISTANCE_TILES = 128;
+
+	/** Off-screen legs planned per tick: a whole roster going out of view at once must not plan in one frame. */
+	private static final int FAR_PLANS_PER_TICK = 6;
+
+	/** Path search cost allowed per frame for visible pets, and per tick for the watchdog. */
+	private static final int SEARCH_BUDGET_PER_FRAME = 8;
+	private static final int WATCHDOG_SEARCH_BUDGET = 8;
+
+	/** A pet near the player now and then stops to look at them, unless there are many pets about. */
+	private static final int WATCHING_CROWD = 5;
+	private static final int WATCH_TILES = 12;
+	private static final float WATCH_CHANCE = 0.01f;
+	private static final int WATCH_TICKS = 8;
 	private static final int FOUND_DISTANCE_TILES = 6;
 	private static final int REROUTE_TILES = 12;
 	private static final int REROUTE_TICKS = 10;
@@ -184,6 +197,7 @@ public class FreeRangePetsPlugin extends Plugin
 	private final Set<Integer> hiddenPohNpcIndices = new HashSet<>();
 	private final TileMap occupancy = new TileMap(64);
 	private final Random scatterRandom = new Random();
+	private final Random moods = new Random();
 
 	private RoamContext roamContext;
 	private FreeRangePetsPanel panel;
@@ -201,6 +215,8 @@ public class FreeRangePetsPlugin extends Plugin
 	private int routedAt;
 
 	private int lastGameCycle = -1;
+	private int lastTick = -1;
+	private int saveAt = -1;
 	private int ticksSinceSave;
 	private int ticksSinceSidebar;
 	private int ticksSinceCensus;
@@ -258,7 +274,7 @@ public class FreeRangePetsPlugin extends Plugin
 		petMenu.setOnRenamed(pet ->
 		{
 			rosterDirty = true;
-			savePets();
+			saveSoon();
 			refreshSidebar();
 		});
 
@@ -268,7 +284,7 @@ public class FreeRangePetsPlugin extends Plugin
 			{
 				pet.setFavourite(!pet.isFavourite());
 				rosterDirty = true;
-				savePets();
+				saveSoon();
 				refreshSidebar();
 			}),
 			pet -> clientThread.invoke(() -> removePet(pet)),
@@ -276,7 +292,7 @@ public class FreeRangePetsPlugin extends Plugin
 			{
 				pet.setNickname(name);
 				rosterDirty = true;
-				savePets();
+				saveSoon();
 				refreshSidebar();
 			}),
 			() -> clientThread.invoke(this::scatterAllPets)
@@ -381,12 +397,9 @@ public class FreeRangePetsPlugin extends Plugin
 	}
 
 	@Subscribe
-	public void onChatMessage(ChatMessage event)
+	public void onMenuOptionClicked(MenuOptionClicked event)
 	{
-		if (event.getType() == ChatMessageType.GAMEMESSAGE || event.getType() == ChatMessageType.SPAM)
-		{
-			detector.onChatMessage(event.getMessage());
-		}
+		detector.onMenuOptionClicked(event.getMenuOption());
 	}
 
 	@Subscribe
@@ -476,6 +489,7 @@ public class FreeRangePetsPlugin extends Plugin
 			abilities.forgetQuests();
 			planner.forgetWaysBack();
 			lastGameCycle = -1;
+			lastTick = -1;
 		}
 	}
 
@@ -508,6 +522,16 @@ public class FreeRangePetsPlugin extends Plugin
 		}
 
 		int tick = client.getTickCount();
+		if (lastTick >= 0 && tick < lastTick)
+		{
+			// The tick counter started again: everything stamped by tick would never expire.
+			for (RoamingPet pet : pets)
+			{
+				pet.timelineReset();
+			}
+			roamContext.timelineReset();
+		}
+		lastTick = tick;
 		roamContext.setTick(tick);
 
 		if (++ticksSinceCensus >= CENSUS_REFRESH_TICKS)
@@ -515,6 +539,11 @@ public class FreeRangePetsPlugin extends Plugin
 			ticksSinceCensus = 0;
 			census.recount(pets);
 		}
+
+		int plansLeft = FAR_PLANS_PER_TICK;
+		roamContext.setSearchBudget(WATCHDOG_SEARCH_BUDGET);
+		WorldPoint playerAt = localPlayerTile();
+		boolean fewInView = drawnPets.size() <= WATCHING_CROWD;
 
 		for (RoamingPet pet : pets)
 		{
@@ -532,18 +561,24 @@ public class FreeRangePetsPlugin extends Plugin
 
 			if (pet.getTier() == PetTier.FAR && pet.farCheckDue(tick))
 			{
-				pet.advanceFar(roamContext, planner);
-				pet.scheduleFarCheck(tick, FAR_CHECK_INTERVAL_TICKS);
+				if (!pet.needsFarPlan(tick) || plansLeft > 0)
+				{
+					if (pet.advanceFar(roamContext, planner))
+					{
+						plansLeft--;
+					}
+					pet.scheduleFarCheck(tick, FAR_CHECK_INTERVAL_TICKS);
+				}
 			}
 
-			// Watchdog: free any pet stuck in a sealed pocket or unable to move.
-			if (pet.isStuck(tick) || isTrapped(pet))
+			plansLeft = rescueIfStuck(pet, tick, plansLeft);
+
+			if (fewInView && playerAt != null && pet.mayWatch() && moods.nextFloat() < WATCH_CHANCE)
 			{
-				if (!pet.workFree(roamContext, planner))
+				WorldPoint at = pet.currentTile();
+				if (at.getPlane() == playerAt.getPlane() && at.distanceTo2D(playerAt) <= WATCH_TILES)
 				{
-					WorldPoint rescued = planner.pickScatterTile(pet.currentTile(), census, scatterRandom);
-					pet.relocate(rescued);
-					pet.noteUnstuck(tick);
+					pet.watch(tick + WATCH_TICKS, playerAt.getX() - at.getX(), playerAt.getY() - at.getY());
 				}
 			}
 		}
@@ -558,11 +593,72 @@ public class FreeRangePetsPlugin extends Plugin
 			refreshSidebar();
 		}
 
-		if (++ticksSinceSave >= SAVE_INTERVAL_TICKS)
+		if ((saveAt >= 0 && client.getTickCount() >= saveAt) || ++ticksSinceSave >= SAVE_INTERVAL_TICKS)
 		{
-			ticksSinceSave = 0;
 			savePets();
 		}
+	}
+
+	/**
+	 * Moves a pet that has stopped getting anywhere. A visible pet somewhere it
+	 * could not have walked to is put right at once; otherwise the cheap fixes
+	 * come first (spin, back out, re-plan) and only then is it carried to the
+	 * nearest walkable tile, with a fresh spot elsewhere as the last resort.
+	 *
+	 * @return the FAR plans left this tick
+	 */
+	private int rescueIfStuck(RoamingPet pet, int tick, int plansLeft)
+	{
+		if (pet.inTransition())
+		{
+			return plansLeft;
+		}
+		WorldPoint at = pet.currentTile();
+		boolean onOrigin = transportNetwork.hasOrigin(at.getX(), at.getY());
+
+		if (pet.getTier() != PetTier.FAR && !onOrigin
+			&& !collisionMap.isKnownWalkable(at.getX(), at.getY(), at.getPlane()))
+		{
+			WorldPoint safe = planner.snapToMesh(at);
+			if (!safe.equals(at))
+			{
+				log.debug("Pet {} was on unwalkable ground at {}; moved to {}", pet.getId(), at, safe);
+				pet.relocate(safe);
+				pet.noteUnstuck(tick);
+				return plansLeft;
+			}
+		}
+
+		// A FAR pet partway along its leg is between planned tiles, not trapped.
+		boolean trapped = !onOrigin && (pet.getTier() != PetTier.FAR || pet.needsFarPlan(tick)) && isTrapped(at);
+		if (!trapped && !pet.isStuck(tick))
+		{
+			return plansLeft;
+		}
+		if (pet.getTier() == PetTier.FAR)
+		{
+			if (plansLeft <= 0)
+			{
+				return plansLeft;
+			}
+			plansLeft--;
+		}
+		if (!trapped && pet.workFree(roamContext, planner))
+		{
+			return plansLeft;
+		}
+
+		WorldPoint safe = planner.snapToMesh(at);
+		if (safe.equals(at) || isTrapped(safe))
+		{
+			// The mesh says it is fine here, so it is stuck for a reason the map cannot see.
+			census.recount(pets);
+			safe = planner.pickScatterTile(at, census, scatterRandom);
+		}
+		log.debug("Rescuing stuck pet {} from {} to {}", pet.getId(), at, safe);
+		pet.relocate(safe);
+		pet.noteUnstuck(tick);
+		return plansLeft;
 	}
 
 	@Subscribe
@@ -601,7 +697,7 @@ public class FreeRangePetsPlugin extends Plugin
 			}
 		}
 
-		int searchBudget = PATH_SEARCHES_PER_FRAME;
+		roamContext.setSearchBudget(SEARCH_BUDGET_PER_FRAME);
 		drawnPets.clear();
 
 		for (RoamingPet pet : pets)
@@ -627,10 +723,9 @@ public class FreeRangePetsPlugin extends Plugin
 				continue;
 			}
 
-			roamContext.setMayPath(searchBudget > 0);
-			if (elapsed > 0 && pet.advanceLocal(elapsed, roamContext))
+			if (elapsed > 0)
 			{
-				searchBudget--;
+				pet.advanceLocal(elapsed, roamContext);
 			}
 
 			if (tier == PetTier.SCENE)
@@ -656,7 +751,7 @@ public class FreeRangePetsPlugin extends Plugin
 		{
 			return PetTier.SCENE;
 		}
-		if (playerAt != null && playerAt.getPlane() == pet.getPlane())
+		if (playerAt != null)
 		{
 			int dist = WorldLayout.span(
 				pet.getFineX() / RoamingPet.TILE - playerAt.getX(),
@@ -669,9 +764,8 @@ public class FreeRangePetsPlugin extends Plugin
 		return PetTier.FAR;
 	}
 
-	private boolean isTrapped(RoamingPet pet)
+	private boolean isTrapped(WorldPoint at)
 	{
-		WorldPoint at = pet.currentTile();
 		return worldMesh.isSealedPocket(at.getX(), at.getY(), at.getPlane())
 			|| worldMesh.isWater(at.getX(), at.getY(), at.getPlane());
 	}
@@ -693,6 +787,8 @@ public class FreeRangePetsPlugin extends Plugin
 		census.recount(pets);
 		boolean addedAny = false;
 
+		Map<NPC, PetSnapshot> menagerie = new LinkedHashMap<>();
+		Set<Integer> presentIds = new HashSet<>();
 		for (NPC npc : wv.npcs())
 		{
 			if (!detector.isMenageriePet(client, npc))
@@ -700,18 +796,27 @@ public class FreeRangePetsPlugin extends Plugin
 				continue;
 			}
 			hiddenPohNpcIndices.add(npc.getIndex());
-
 			PetSnapshot snap = PetSnapshot.fromNpc(npc);
-			if (snap == null)
+			if (snap != null)
 			{
-				continue;
+				menagerie.put(npc, snap);
+				presentIds.add(snap.getNpcId());
 			}
+		}
 
-			RoamingPet existing = findByNpcIdOrName(snap.getNpcId(), snap.getName());
+		Set<RoamingPet> matched = new HashSet<>();
+		for (Map.Entry<NPC, PetSnapshot> entry : menagerie.entrySet())
+		{
+			NPC npc = entry.getKey();
+			PetSnapshot snap = entry.getValue();
+
+			RoamingPet existing = findExisting(snap, presentIds, matched);
 			if (existing != null)
 			{
+				matched.add(existing);
 				if (existing.getSnapshot().getNpcId() != snap.getNpcId())
 				{
+					// The same pet in another form (a metamorphosis, say): take its new look.
 					existing.setSnapshot(snap);
 					detachRenderer(existing);
 					rosterDirty = true;
@@ -724,6 +829,7 @@ public class FreeRangePetsPlugin extends Plugin
 			WorldPoint startTile = planner.pickScatterTile(portal.getPortalTile(), census, scatterRandom);
 			RoamingPet freed = new RoamingPet(seed, snap, startTile, npc.getCurrentOrientation());
 			pets.add(freed);
+			matched.add(freed);
 			addedAny = true;
 			log.debug("Freed POH menagerie pet '{}' (npc {}) at {}", snap.getName(), snap.getNpcId(), startTile);
 		}
@@ -791,7 +897,7 @@ public class FreeRangePetsPlugin extends Plugin
 				}
 			}
 
-			if (clumped || isTrapped(pet))
+			if (clumped || isTrapped(at))
 			{
 				WorldPoint spread = planner.pickScatterTile(at, census, scatterRandom);
 				pet.relocate(spread);
@@ -817,23 +923,32 @@ public class FreeRangePetsPlugin extends Plugin
 		}
 	}
 
-	private RoamingPet findByNpcIdOrName(int npcId, String name)
+	/**
+	 * The roaming pet a menagerie NPC already is: by NPC id, or by name for a pet
+	 * whose form changed. A name match is only taken for a roaming pet whose own
+	 * NPC id is not also in the menagerie, so two pets sharing a name stay two pets.
+	 */
+	private RoamingPet findExisting(PetSnapshot snap, Set<Integer> presentIds, Set<RoamingPet> matched)
 	{
 		for (RoamingPet pet : pets)
 		{
-			if (pet.getSnapshot().getNpcId() == npcId)
+			if (pet.getSnapshot().getNpcId() == snap.getNpcId())
 			{
 				return pet;
 			}
 		}
-		if (name != null)
+		String name = snap.getName();
+		if (name == null)
 		{
-			for (RoamingPet pet : pets)
+			return null;
+		}
+		for (RoamingPet pet : pets)
+		{
+			if (!matched.contains(pet)
+				&& !presentIds.contains(pet.getSnapshot().getNpcId())
+				&& name.equalsIgnoreCase(pet.getSnapshot().getName()))
 			{
-				if (name.equalsIgnoreCase(pet.getSnapshot().getName()))
-				{
-					return pet;
-				}
+				return pet;
 			}
 		}
 		return null;
@@ -1134,8 +1249,18 @@ public class FreeRangePetsPlugin extends Plugin
 		refreshSidebar();
 	}
 
+	private void saveSoon()
+	{
+		if (saveAt < 0)
+		{
+			saveAt = client.getTickCount() + SAVE_SOON_TICKS;
+		}
+	}
+
 	private void savePets()
 	{
+		saveAt = -1;
+		ticksSinceSave = 0;
 		if (!running || rosterAccount == null || !pendingRestore.isEmpty())
 		{
 			return;
